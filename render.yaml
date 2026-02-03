@@ -5,10 +5,7 @@ services:
     plan: free
     autoDeploy: true
 
-    buildCommand: |
-      pip install --upgrade pip
-      pip install --no-cache-dir -r requirements.txt
-
+    buildCommand: pip install --upgrade pip && pip install --no-cache-dir -r requirements.txt
     startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
 
     healthCheckPath: /health
@@ -34,13 +31,20 @@ services:
       - key: TT_API_TOKEN
         sync: false
 
-      # Kotak
-      - key: NEO_CONSUMER_KEY
-        sync: false
-      - key: NEO_USERNAME
+      # Kotak creds (MOBILE LOGIN)
+      - key: NEO_MOBILE
         sync: false
       - key: NEO_PASSWORD
         sync: false
       - key: NEO_TOTP_SECRET
         sync: false
 
+      # Endpoints — set via UI once you know the exact paths
+      - key: NEO_BASE_URL
+        value: "https://napi.kotaksecurities.com"
+      - key: NEO_LOGIN_URL
+        value: ""
+      - key: NEO_QUOTES_URL
+        value: ""
+      - key: NEO_OPTIONCHAIN_URL
+        value: ""

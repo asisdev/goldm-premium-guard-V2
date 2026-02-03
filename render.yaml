@@ -1,0 +1,46 @@
+services:
+  - type: web
+    name: goldm-premium-guard
+    env: python
+    plan: free
+    autoDeploy: true
+
+    buildCommand: |
+      pip install --upgrade pip
+      pip install --no-cache-dir -r requirements.txt
+
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+
+    healthCheckPath: /health
+    healthCheckTimeout: 100
+
+    envVars:
+      - key: LOOKBACK_MIN
+        value: "5"
+      - key: UNDER_MOVE_PCT
+        value: "0.20"
+      - key: OPT_STALE_PCT
+        value: "0.10"
+      - key: TOP_K
+        value: "5"
+      - key: RUN_INTERVAL_S
+        value: "60"
+      - key: ALERT_SILENCE_MIN
+        value: "5"
+
+      # Tradetron
+      - key: TT_WEBHOOK_URL
+        sync: false
+      - key: TT_API_TOKEN
+        sync: false
+
+      # Kotak
+      - key: NEO_CONSUMER_KEY
+        sync: false
+      - key: NEO_USERNAME
+        sync: false
+      - key: NEO_PASSWORD
+        sync: false
+      - key: NEO_TOTP_SECRET
+        sync: false
+

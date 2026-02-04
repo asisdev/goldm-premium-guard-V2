@@ -4,12 +4,13 @@ services:
     env: python
     plan: free
     autoDeploy: true
+
     buildCommand: pip install --upgrade pip && pip install --no-cache-dir -r requirements.txt
     startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
-    healthCheckTimeout: 100
+
     envVars:
-      # Strategy
+      # Strategy settings
       - key: LOOKBACK_MIN
         value: "5"
       - key: UNDER_MOVE_PCT
@@ -22,36 +23,19 @@ services:
         value: "60"
       - key: ALERT_SILENCE_MIN
         value: "5"
-      # TT (fill in UI)
+
+      # Tradetron Webhook
       - key: TT_WEBHOOK_URL
         sync: false
       - key: TT_API_TOKEN
         sync: false
-      # Kotak identity (same you use in Tradetron)
+
+      # Kotak Neo Official Login (SDK-based)
       - key: NEO_MOBILE
         sync: false
       - key: NEO_PASSWORD
         sync: false
       - key: NEO_TOTP_SECRET
         sync: false
-      - key: NEO_CLIENT_CODE
+      - key: NEO_CONSUMER_KEY
         sync: false
-      - key: NEO_MPIN
-        sync: false
-      - key: NEO_ACCESS_TOKEN
-        sync: false
-      # v2 endpoints (defaults from migration guide)
-      - key: NEO_TOTP_LOGIN_URL
-        value: "https://mis.kotaksecurities.com/login/1.0/tradeApiLogin"
-      - key: NEO_MPIN_VALIDATE_URL
-        value: "https://mis.kotaksecurities.com/login/1.0/tradeApiValidate"
-      # After validate, we get baseUrl → append these PATHS to it
-      - key: NEO_QUOTES_PATH
-        value: ""
-      - key: NEO_OPTIONCHAIN_PATH
-        value: ""
-      # Token header config
-      - key: NEO_TOKEN_HEADER_KEY
-        value: "x-api-token"
-      - key: NEO_TOKEN_PREFIX
-        value: ""

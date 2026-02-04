@@ -1,4 +1,4 @@
-import os, time, json, asyncio, logging
+import os, time, json, asyncio, logging, base64, re
 from collections import deque, defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
@@ -7,7 +7,9 @@ import requests
 import pyotp
 from fastapi import FastAPI
 
-# -------------------- Config from ENV --------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# Config (ENV)
+# ─────────────────────────────────────────────────────────────────────────────
 IST = timezone(timedelta(hours=5, minutes=30))
 
 # Strategy knobs
@@ -22,189 +24,75 @@ SILENCE_MIN    = int(os.getenv("ALERT_SILENCE_MIN", "5"))
 TT_WEBHOOK_URL = os.getenv("TT_WEBHOOK_URL")
 TT_API_TOKEN   = os.getenv("TT_API_TOKEN")
 
-# Kotak login (Mobile + Password + TOTP)
-NEO_MOBILE      = os.getenv("NEO_MOBILE")         # e.g., 9434895910  (do NOT hardcode)
-NEO_PASSWORD    = os.getenv("NEO_PASSWORD")
-NEO_TOTP_SECRET = os.getenv("NEO_TOTP_SECRET")    # base32 secret from your Authenticator
+# Kotak v2 login — your identity & tokens (same set you use in Tradetron)
+NEO_MOBILE       = os.getenv("NEO_MOBILE")        # e.g., 9434895910
+NEO_PASSWORD     = os.getenv("NEO_PASSWORD")      # trading login password
+NEO_TOTP_SECRET  = os.getenv("NEO_TOTP_SECRET")   # base32 secret (NOT the 6-digit code)
+NEO_CLIENT_CODE  = os.getenv("NEO_CLIENT_CODE")   # UCC / client code (e.g., YNINF)
+NEO_MPIN         = os.getenv("NEO_MPIN")          # 6-digit MPIN
+NEO_ACCESS_TOKEN = os.getenv("NEO_ACCESS_TOKEN")  # token copied from API Dashboard
 
-# Kotak REST endpoints (configurable)
-NEO_BASE_URL         = os.getenv("NEO_BASE_URL", "https://napi.kotaksecurities.com")
-NEO_LOGIN_URL        = os.getenv("NEO_LOGIN_URL", "")        # if empty, app will try candidates
-NEO_QUOTES_URL       = os.getenv("NEO_QUOTES_URL", "")       # e.g., quotes endpoint
-NEO_OPTIONCHAIN_URL  = os.getenv("NEO_OPTIONCHAIN_URL", "")  # e.g., option-chain endpoint
+# Fixed v2 endpoints (from migration guide) for login + validate
+# Keep editable: some tenants front these via different hosts.
+NEO_TOTP_LOGIN_URL = os.getenv(
+    "NEO_TOTP_LOGIN_URL",
+    "https://mis.kotaksecurities.com/login/1.0/tradeApiLogin"
+)
+NEO_MPIN_VALIDATE_URL = os.getenv(
+    "NEO_MPIN_VALIDATE_URL",
+    "https://mis.kotaksecurities.com/login/1.0/tradeApiValidate"
+)
 
-# -------------------- App/Logs --------------------
+# After MPIN validate, we MUST use {{baseUrl}} for everything else:
+# Keep these as RELATIVE PATHS; the code will prepend baseUrl.
+QUOTES_PATH       = os.getenv("NEO_QUOTES_PATH", "")        # e.g., "/market/1.0/quotes"
+OPTIONCHAIN_PATH  = os.getenv("NEO_OPTIONCHAIN_PATH", "")   # e.g., "/market/1.0/option-chain"
+
+# Some tenants expect token in different header keys; make it configurable.
+TOKEN_HEADER_KEY  = os.getenv("NEO_TOKEN_HEADER_KEY", "x-api-token")
+TOKEN_PREFIX      = os.getenv("NEO_TOKEN_PREFIX", "")  # usually "" (plain token as per v2)
+
+# Discovery overrides
+GOLDM_UNDERLYING  = os.getenv("GOLDM_FUT_SYMBOL", "GOLDM")  # FUT symbol or tradingsymbol if needed
+
+# ─────────────────────────────────────────────────────────────────────────────
+# App / Buffers
+# ─────────────────────────────────────────────────────────────────────────────
 app = FastAPI()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
-log = logging.getLogger("goldm-rest")
+log = logging.getLogger("goldm-v2")
 
-# Buffers
 under_buf: deque = deque(maxlen=3600)
 hist: Dict[str, deque] = defaultdict(lambda: deque(maxlen=3600))
 last_alert_ts: Optional[datetime] = None
 
-# -------------------- Kotak REST Client (Configurable) --------------------
-class KotakREST:
-    """
-    REST-only client; does NOT use neo_api_client.
-    You MUST supply correct endpoints via env once confirmed with Kotak.
-    """
-    def __init__(self):
-        miss = [k for k, v in {
-            "NEO_MOBILE": NEO_MOBILE,
-            "NEO_PASSWORD": NEO_PASSWORD,
-            "NEO_TOTP_SECRET": NEO_TOTP_SECRET
-        }.items() if not v]
-        if miss:
-            raise RuntimeError(f"Missing env vars: {', '.join(miss)}")
+# Global session state (after MPIN validation)
+SESSION = {
+    "baseUrl": None,          # from MPIN validation
+    "tradeSid": None,         # if returned
+    "tradeToken": None        # if returned
+}
 
-        self.session = requests.Session()
-        self.tokens: Dict[str, str] = {}
-        self.logged_in = False
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
+def normalize_base32_secret(raw: str) -> str:
+    if not raw:
+        raise ValueError("Empty TOTP secret")
+    s = re.sub(r'[^A-Za-z2-7]', '', str(raw)).upper()   # keep base32 charset only
+    s = s + ('=' * ((8 - (len(s) % 8)) % 8))            # pad to multiple of 8
+    base64.b32decode(s, casefold=True)                  # validate
+    return s
 
-        # Build candidate login endpoints/payload shapes
-        self.login_urls = [u for u in [
-            NEO_LOGIN_URL.strip() or "",
-            f"{NEO_BASE_URL.rstrip('/')}/api/login",
-            f"{NEO_BASE_URL.rstrip('/')}/auth/1.0/login",
-            f"{NEO_BASE_URL.rstrip('/')}/login/1.0/login"
-        ] if u]
-
-        # Payload variants commonly seen in different deployments
-        self.payload_variants = [
-            lambda totp: {"mobile": NEO_MOBILE, "password": NEO_PASSWORD, "totp": totp},
-            lambda totp: {"mobilenumber": NEO_MOBILE, "password": NEO_PASSWORD, "totp": totp},
-            lambda totp: {"username": NEO_MOBILE, "password": NEO_PASSWORD, "totp": totp},
-            lambda totp: {"userid": NEO_MOBILE, "password": NEO_PASSWORD, "totp": totp},
-        ]
-
-    def _extract_token_from_response(self, j: dict) -> Optional[str]:
-        """
-        Try multiple common keys that may carry an access/session token.
-        """
-        for key in ("access_token", "session_token", "token", "jwt", "jwtToken", "authorization"):
-            val = j.get(key)
-            if isinstance(val, str) and len(val) > 10:
-                return val
-        # Sometimes token is nested under 'data'
-        data = j.get("data") or {}
-        if isinstance(data, dict):
-            for key in ("access_token", "session_token", "token", "jwt", "jwtToken", "authorization"):
-                val = data.get(key)
-                if isinstance(val, str) and len(val) > 10:
-                    return val
-        return None
-
-    def login(self) -> bool:
-        totp_code = pyotp.TOTP(NEO_TOTP_SECRET).now()
-        headers = {"Content-Type": "application/json"}
-
-        for url in self.login_urls:
-            for make_payload in self.payload_variants:
-                payload = make_payload(totp_code)
-                try:
-                    r = self.session.post(url, headers=headers, data=json.dumps(payload), timeout=10)
-                    if r.status_code >= 500:
-                        log.warning(f"Login server error at {url}: {r.status_code}")
-                        continue
-                    j = {}
-                    try:
-                        j = r.json()
-                    except Exception:
-                        pass
-
-                    if r.ok:
-                        token = self._extract_token_from_response(j) or r.headers.get("Authorization")
-                        if token:
-                            self.tokens["auth"] = token
-                            self.logged_in = True
-                            log.info(f"Login OK via {url} (payload keys={list(payload.keys())})")
-                            return True
-                        else:
-                            log.warning(f"Login response OK but token not found (url={url}) resp_keys={list(j.keys())}")
-                    else:
-                        log.warning(f"Login failed at {url} {r.status_code} body={j or r.text[:200]}")
-                except Exception as e:
-                    log.warning(f"Login attempt exception at {url}: {e}")
-        return False
-
-    def ensure(self) -> bool:
-        if not self.logged_in:
-            return self.login()
-        return True
-
-    def auth_headers(self) -> Dict[str, str]:
-        h = {"Content-Type": "application/json"}
-        auth = self.tokens.get("auth")
-        if auth:
-            # Support both bare token and Bearer patterns
-            if not auth.lower().startswith("bearer "):
-                h["Authorization"] = f"Bearer {auth}"
-            else:
-                h["Authorization"] = auth
-        return h
-
-    # ---- Quotes for a list of symbols (You MUST set NEO_QUOTES_URL) ----
-    def quotes(self, symbols: List[str]) -> Dict[str, dict]:
-        if not self.ensure():
-            return {}
-        if not NEO_QUOTES_URL:
-            log.info("NEO_QUOTES_URL not set; skipping quotes call.")
-            return {}
-        url = NEO_QUOTES_URL.strip()
-        try:
-            body = {"symbols": symbols}
-            r = self.session.post(url, headers=self.auth_headers(), data=json.dumps(body), timeout=10)
-            j = r.json() if r.headers.get("content-type","").startswith("application/json") else {}
-            out = {}
-            # Try to normalize response structure
-            rows = j.get("data") or j.get("quotes") or j if isinstance(j, list) else []
-            if isinstance(rows, list):
-                for row in rows:
-                    sym = row.get("tradingsymbol") or row.get("symbol") or row.get("instrument_token")
-                    ltp = row.get("last_price") or row.get("ltp")
-                    oi  = row.get("oi") or row.get("open_interest")
-                    if sym:
-                        out[sym] = {
-                            "ltp": float(ltp) if ltp not in (None, "") else None,
-                            "oi": int(oi) if oi not in (None, "") else None
-                        }
-            return out
-        except Exception as e:
-            log.error(f"quotes error: {e}")
-            return {}
-
-    # ---- Option chain for GOLDM (You MUST set NEO_OPTIONCHAIN_URL or skip) ----
-    def option_chain(self, symbol: str) -> List[dict]:
-        if not self.ensure():
-            return []
-        if not NEO_OPTIONCHAIN_URL:
-            log.info("NEO_OPTIONCHAIN_URL not set; skipping option-chain call.")
-            return []
-        url = NEO_OPTIONCHAIN_URL.strip()
-        try:
-            body = {"symbol": symbol}
-            r = self.session.post(url, headers=self.auth_headers(), data=json.dumps(body), timeout=10)
-            j = r.json() if r.headers.get("content-type","").startswith("application/json") else {}
-            rows = j.get("data") or j.get("options") or []
-            return rows if isinstance(rows, list) else []
-        except Exception as e:
-            log.error(f"option_chain error: {e}")
-            return []
-
-# -------------------- Helpers --------------------
 def pct_change(buf: deque, lookback_min: int) -> Optional[float]:
-    if len(buf) < 2:
-        return None
+    if len(buf) < 2: return None
     cutoff = time.time() - lookback_min * 60
     while buf and buf[0][0] < cutoff:
         buf.popleft()
-    if len(buf) < 2:
-        return None
+    if len(buf) < 2: return None
     t0, p0 = buf[0]
     t1, p1 = buf[-1]
-    if not p0 or p1 is None:
-        return None
+    if not p0 or p1 is None: return None
     return 100.0 * (p1 - p0) / p0
 
 def should_alert(u, ce, pe):
@@ -223,111 +111,233 @@ def post_tradetron(payload: dict):
     except Exception as e:
         log.error(f"Tradetron webhook error: {e}")
 
-# -------------------- Main Engine (safe; never crashes the server) --------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# Kotak v2 client: TOTP login → MPIN validate → baseUrl
+# ─────────────────────────────────────────────────────────────────────────────
+class KotakV2:
+    def __init__(self):
+        miss = [k for k,v in {
+            "NEO_MOBILE": NEO_MOBILE,
+            "NEO_PASSWORD": NEO_PASSWORD,
+            "NEO_TOTP_SECRET": NEO_TOTP_SECRET,
+            "NEO_CLIENT_CODE": NEO_CLIENT_CODE,
+            "NEO_MPIN": NEO_MPIN,
+            "NEO_ACCESS_TOKEN": NEO_ACCESS_TOKEN
+        }.items() if not v]
+        if miss:
+            raise RuntimeError(f"Missing env vars: {', '.join(miss)}")
+        self.s = requests.Session()
+
+    def login_totp(self) -> bool:
+        """
+        v2: Fixed endpoint (per migration doc) for TOTP login.
+        We pass the plain ACCESS TOKEN in headers (no Bearer), as per v2 note.
+        """
+        try:
+            secret = normalize_base32_secret(NEO_TOTP_SECRET)
+            totp = pyotp.TOTP(secret).now()
+        except Exception as e:
+            log.error(f"TOTP secret error: {e}")
+            return False
+
+        headers = {
+            "Content-Type": "application/json",
+            TOKEN_HEADER_KEY: f"{TOKEN_PREFIX}{NEO_ACCESS_TOKEN}".strip()
+        }
+        body = {
+            "mobile": str(NEO_MOBILE),
+            "password": NEO_PASSWORD,
+            "totp": totp
+        }
+        try:
+            r = self.s.post(NEO_TOTP_LOGIN_URL, headers=headers, data=json.dumps(body), timeout=15)
+            if not r.ok:
+                log.warning(f"TOTP login failed {r.status_code}: {r.text[:200]}")
+                return False
+            log.info("TOTP login OK.")
+            return True
+        except Exception as e:
+            log.error(f"TOTP login exception: {e}")
+            return False
+
+    def validate_mpin(self) -> bool:
+        """
+        v2: MPIN validation returns baseUrl; we must use that for subsequent routes.
+        """
+        headers = {
+            "Content-Type": "application/json",
+            TOKEN_HEADER_KEY: f"{TOKEN_PREFIX}{NEO_ACCESS_TOKEN}".strip()
+        }
+        body = {
+            "clientId": NEO_CLIENT_CODE,
+            "mpin": str(NEO_MPIN)
+        }
+        try:
+            r = self.s.post(NEO_MPIN_VALIDATE_URL, headers=headers, data=json.dumps(body), timeout=15)
+            if not r.ok:
+                log.warning(f"MPIN validate failed {r.status_code}: {r.text[:200]}")
+                return False
+            j = r.json() if "application/json" in r.headers.get("content-type","") else {}
+            base_url = j.get("baseUrl") or (j.get("data",{}) if isinstance(j.get("data"), dict) else {}).get("baseUrl")
+            SESSION["baseUrl"] = base_url
+            SESSION["tradeSid"] = j.get("tradeSid") or j.get("sid")
+            SESSION["tradeToken"] = j.get("tradeToken") or j.get("token")
+            if not SESSION["baseUrl"]:
+                log.warning(f"MPIN validate OK but baseUrl missing in response keys={list(j.keys())}")
+                return False
+            log.info(f"MPIN validate OK. baseUrl={SESSION['baseUrl']}")
+            return True
+        except Exception as e:
+            log.error(f"MPIN validate exception: {e}")
+            return False
+
+    def ensure_session(self) -> bool:
+        if not SESSION["baseUrl"]:
+            return self.login_totp() and self.validate_mpin()
+        return True
+
+    def _build_url(self, rel_path: str) -> Optional[str]:
+        base = SESSION["baseUrl"]
+        if not base or not rel_path:
+            return None
+        return f"{base.rstrip('/')}/{rel_path.lstrip('/')}"
+
+    def quotes(self, symbols: List[str]) -> Dict[str, dict]:
+        if not self.ensure_session(): return {}
+        url = self._build_url(QUOTES_PATH)
+        if not url:
+            log.info("NEO_QUOTES_PATH not set; skipping quotes.")
+            return {}
+        headers = {"Content-Type": "application/json", TOKEN_HEADER_KEY: f"{TOKEN_PREFIX}{NEO_ACCESS_TOKEN}".strip()}
+        body = {"symbols": symbols}
+        try:
+            r = self.s.post(url, headers=headers, data=json.dumps(body), timeout=15)
+            j = r.json() if "application/json" in r.headers.get("content-type","") else {}
+            rows = j.get("data") or j.get("quotes") or (j if isinstance(j, list) else [])
+            out = {}
+            for row in rows:
+                sym = row.get("tradingsymbol") or row.get("symbol")
+                ltp = row.get("last_price") or row.get("ltp")
+                oi  = row.get("oi") or row.get("open_interest")
+                if sym:
+                    out[sym] = {
+                        "ltp": float(ltp) if ltp not in (None, "") else None,
+                        "oi": int(oi) if oi not in (None, "") else None
+                    }
+            return out
+        except Exception as e:
+            log.error(f"quotes error: {e}")
+            return {}
+
+    def option_chain(self, underlying: str="GOLDM") -> List[dict]:
+        if not self.ensure_session(): return []
+        url = self._build_url(OPTIONCHAIN_PATH)
+        if not url:
+            log.info("NEO_OPTIONCHAIN_PATH not set; skipping option-chain.")
+            return []
+        headers = {"Content-Type": "application/json", TOKEN_HEADER_KEY: f"{TOKEN_PREFIX}{NEO_ACCESS_TOKEN}".strip()}
+        body = {"symbol": underlying}
+        try:
+            r = self.s.post(url, headers=headers, data=json.dumps(body), timeout=15)
+            j = r.json() if "application/json" in r.headers.get("content-type","") else {}
+            rows = j.get("data") or j.get("options") or []
+            return rows if isinstance(rows, list) else []
+        except Exception as e:
+            log.error(f"option_chain error: {e}")
+            return []
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Engine
+# ─────────────────────────────────────────────────────────────────────────────
 async def engine_loop():
     global last_alert_ts
     try:
-        broker = KotakREST()
+        broker = KotakV2()
     except Exception as e:
         log.error(f"ENV error: {e}")
-        # Keep server alive; retry later
         while True:
             await asyncio.sleep(max(30, RUN_INTERVAL_S))
-        # (return not needed)
-
-    # NOTE: You must set correct endpoints (NEO_QUOTES_URL / NEO_OPTIONCHAIN_URL)
-    # The loop is resilient and will keep running even if calls fail.
-
-    fut_symbol = os.getenv("GOLDM_FUT_SYMBOL", "GOLDM")  # allow override
-    ce_list: List[str] = []
-    pe_list: List[str] = []
 
     while True:
         now = datetime.now(IST)
         now_ts = time.time()
 
-        # ---- Underlying FUT LTP (if quotes endpoint is provided) ----
+        # Underlying FUT (if quotes path is set)
         try:
-            if NEO_QUOTES_URL:
-                u_q = broker.quotes([fut_symbol]).get(fut_symbol, {})
-                u = u_q.get("ltp")
-                if u is not None:
-                    under_buf.append((now_ts, float(u)))
+            q_u = broker.quotes([GOLDM_UNDERLYING]).get(GOLDM_UNDERLYING, {})
+            u = q_u.get("ltp")
+            if u is not None:
+                under_buf.append((now_ts, float(u)))
         except Exception as e:
             log.error(f"Underlying quote error: {e}")
 
-        # ---- Option chain (if endpoint provided) ----
+        # Option-chain → max OI CE/PE
         try:
-            if NEO_OPTIONCHAIN_URL:
-                chain = broker.option_chain("GOLDM")
-                # Normalize minimal structure
-                quotes: Dict[str, dict] = {}
-                ce_list.clear()
-                pe_list.clear()
-                for row in chain:
-                    ts = row.get("tradingsymbol") or row.get("symbol")
-                    ltp = row.get("last_price") or row.get("ltp")
-                    oi  = row.get("oi") or row.get("open_interest")
-                    typ = row.get("option_type") or row.get("type")
-                    if not ts or not typ:
-                        continue
-                    quotes[ts] = {
-                        "ltp": float(ltp) if ltp not in (None, "") else None,
-                        "oi": int(oi) if oi not in (None, "") else None
+            chain = broker.option_chain("GOLDM")
+            quotes = {}
+            ce_syms, pe_syms = [], []
+            for row in chain:
+                ts  = row.get("tradingsymbol") or row.get("symbol")
+                ltp = row.get("last_price") or row.get("ltp")
+                oi  = row.get("oi") or row.get("open_interest")
+                typ = (row.get("option_type") or row.get("type") or "").upper()
+                if not ts or not typ: continue
+                quotes[ts] = {
+                    "ltp": float(ltp) if ltp not in (None, "") else None,
+                    "oi": int(oi) if oi not in (None, "") else None
+                }
+                if typ == "CE": ce_syms.append(ts)
+                elif typ == "PE": pe_syms.append(ts)
+
+            for ts, meta in quotes.items():
+                if meta.get("ltp") is not None:
+                    hist[ts].append((now_ts, float(meta["ltp"])))
+
+            ce_sorted = sorted([s for s in ce_syms if quotes.get(s,{}).get("oi") is not None],
+                               key=lambda s: quotes[s]["oi"], reverse=True)
+            pe_sorted = sorted([s for s in pe_syms if quotes.get(s,{}).get("oi") is not None],
+                               key=lambda s: quotes[s]["oi"], reverse=True)
+
+            ce_pick = ce_sorted[0] if ce_sorted else None
+            pe_pick = pe_sorted[0] if pe_sorted else None
+
+            u_pct  = pct_change(under_buf, LOOKBACK_MIN)
+            ce_pct = pct_change(hist[ce_pick], LOOKBACK_MIN) if ce_pick else None
+            pe_pct = pct_change(hist[pe_pick], LOOKBACK_MIN) if pe_pick else None
+
+            log.info(f"Pick CE={ce_pick} PE={pe_pick} | U%={u_pct} CE%={ce_pct} PE%={pe_pct}")
+
+            if ce_pick and pe_pick and should_alert(u_pct, ce_pct, pe_pct):
+                if (last_alert_ts is None) or (now - last_alert_ts >= timedelta(minutes=SILENCE_MIN)):
+                    payload = {
+                        "event": "goldm_non_responsive",
+                        "u_pct": round(u_pct,4) if u_pct is not None else None,
+                        "ce_pct": round(ce_pct,4) if ce_pct is not None else None,
+                        "pe_pct": round(pe_pct,4) if pe_pct is not None else None,
+                        "ce_symbol": ce_pick,
+                        "pe_symbol": pe_pick,
+                        "lookback_min": LOOKBACK_MIN,
+                        "thresholds": {"under": UNDER_MOVE_PCT, "opt": OPT_STALE_PCT},
+                        "ts": now.isoformat()
                     }
-                    if str(typ).upper() == "CE":
-                        ce_list.append(ts)
-                    elif str(typ).upper() == "PE":
-                        pe_list.append(ts)
-
-                # Update price histories
-                for sym, meta in quotes.items():
-                    if meta.get("ltp") is not None:
-                        hist[sym].append((now_ts, float(meta["ltp"])))
-
-                # Pick highest OI CE/PE
-                ce_sorted = sorted(
-                    [s for s in ce_list if quotes.get(s, {}).get("oi") is not None],
-                    key=lambda s: quotes[s]["oi"], reverse=True
-                )
-                pe_sorted = sorted(
-                    [s for s in pe_list if quotes.get(s, {}).get("oi") is not None],
-                    key=lambda s: quotes[s]["oi"], reverse=True
-                )
-                ce_pick = ce_sorted[0] if ce_sorted else None
-                pe_pick = pe_sorted[0] if pe_sorted else None
-
-                u_pct  = pct_change(under_buf, LOOKBACK_MIN)
-                ce_pct = pct_change(hist[ce_pick], LOOKBACK_MIN) if ce_pick else None
-                pe_pct = pct_change(hist[pe_pick], LOOKBACK_MIN) if pe_pick else None
-
-                log.info(f"Pick CE={ce_pick} PE={pe_pick} | U%={u_pct} CE%={ce_pct} PE%={pe_pct}")
-
-                if ce_pick and pe_pick and should_alert(u_pct, ce_pct, pe_pct):
-                    if (last_alert_ts is None) or (now - last_alert_ts >= timedelta(minutes=SILENCE_MIN)):
-                        payload = {
-                            "event": "goldm_non_responsive",
-                            "u_pct": round(u_pct,4) if u_pct is not None else None,
-                            "ce_pct": round(ce_pct,4) if ce_pct is not None else None,
-                            "pe_pct": round(pe_pct,4) if pe_pct is not None else None,
-                            "ce_symbol": ce_pick,
-                            "pe_symbol": pe_pick,
-                            "lookback_min": LOOKBACK_MIN,
-                            "thresholds": {"under": UNDER_MOVE_PCT, "opt": OPT_STALE_PCT},
-                            "ts": now.isoformat()
-                        }
-                        post_tradetron(payload)
-                        last_alert_ts = now
+                    post_tradetron(payload)
+                    last_alert_ts = now
 
         except Exception as e:
             log.error(f"Loop error: {e}")
 
         await asyncio.sleep(RUN_INTERVAL_S)
 
-# -------------------- FastAPI endpoints --------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# API
+# ─────────────────────────────────────────────────────────────────────────────
 @app.on_event("startup")
 async def _startup():
     asyncio.create_task(engine_loop())
+
+@app.get("/")
+def root():
+    return {"service":"goldm-premium-guard","docs":"/docs","status":"/status","health":"/health"}
 
 @app.get("/health")
 def health():
@@ -336,21 +346,32 @@ def health():
 @app.get("/status")
 def status():
     return {
-        "base_url": NEO_BASE_URL,
-        "login_url": NEO_LOGIN_URL or "(using candidates)",
-        "quotes_url": NEO_QUOTES_URL or "(not set)",
-        "optionchain_url": NEO_OPTIONCHAIN_URL or "(not set)",
+        "login_url": NEO_TOTP_LOGIN_URL,
+        "mpin_validate_url": NEO_MPIN_VALIDATE_URL,
+        "baseUrl": SESSION["baseUrl"],
+        "quotes_path": QUOTES_PATH or "(not set)",
+        "optionchain_path": OPTIONCHAIN_PATH or "(not set)",
+        "token_header": TOKEN_HEADER_KEY,
         "lookback_min": LOOKBACK_MIN,
         "under_move_pct": UNDER_MOVE_PCT,
-        "opt_stale_pct": OPT_STALE_PCT,
-        "run_interval_s": RUN_INTERVAL_S
+        "opt_stale_pct": OPT_STALE_PCT
     }
+
+@app.get("/totp/now")
+def totp_now():
+    try:
+        secret = normalize_base32_secret(NEO_TOTP_SECRET)
+        code = pyotp.TOTP(secret).now()
+        return {"ok": True, "totp": code}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 @app.post("/login/test")
 def login_test():
     try:
-        client = KotakREST()
-        ok = client.login()
-        return {"login_ok": ok, "headers_seen": list(client.session.headers.keys()), "has_token": bool(client.tokens.get("auth"))}
+        client = KotakV2()
+        ok1 = client.login_totp()
+        ok2 = client.validate_mpin() if ok1 else False
+        return {"login_totp_ok": ok1, "mpin_validate_ok": ok2, "baseUrl": SESSION["baseUrl"]}
     except Exception as e:
-        return {"login_ok": False, "error": str(e)}
+        return {"login_totp_ok": False, "mpin_validate_ok": False, "error": str(e)}

@@ -10,7 +10,7 @@ services:
     healthCheckPath: /health
 
     envVars:
-      # Strategy settings
+      # --- Strategy settings (tune as you like) ---
       - key: LOOKBACK_MIN
         value: "5"
       - key: UNDER_MOVE_PCT
@@ -24,18 +24,18 @@ services:
       - key: ALERT_SILENCE_MIN
         value: "5"
 
-      # Tradetron Webhook
+      # --- Tradetron Webhook (set in Render UI) ---
       - key: TT_WEBHOOK_URL
         sync: false
       - key: TT_API_TOKEN
         sync: false
 
-      # Kotak Neo Official Login (SDK-based)
+      # --- Kotak Neo Official Login (SDK-based) ---
       - key: NEO_MOBILE
-        sync: false
+        sync: false            # e.g., 9434895910
       - key: NEO_PASSWORD
         sync: false
       - key: NEO_TOTP_SECRET
-        sync: false
+        sync: false           # base32 secret (no quotes/spaces)
       - key: NEO_CONSUMER_KEY
-        sync: false
+        sync: false           # token from Neo app → Invest → Trade API

@@ -11,7 +11,7 @@ import pyotp
 import requests
 from fastapi import FastAPI
 
-# Official Kotak Neo SDK
+# Official Kotak Neo SDK v2
 from neo_api_client import NeoAPI
 
 # -------------------------------------------------------
@@ -30,7 +30,7 @@ SILENCE_MIN = int(os.getenv("ALERT_SILENCE_MIN", "5"))
 TT_WEBHOOK_URL = os.getenv("TT_WEBHOOK_URL")
 TT_API_TOKEN = os.getenv("TT_API_TOKEN")
 
-# Kotak Neo official fields (from SDK documentation)
+# Kotak Neo official fields (from SDK docs)
 NEO_MOBILE = os.getenv("NEO_MOBILE")
 NEO_PASSWORD = os.getenv("NEO_PASSWORD")
 NEO_TOTP_SECRET = os.getenv("NEO_TOTP_SECRET")
@@ -48,7 +48,6 @@ under_buf: deque = deque(maxlen=3600)
 hist: Dict[str, deque] = defaultdict(lambda: deque(maxlen=3600))
 last_alert_ts: Optional[datetime] = None
 
-# global API client
 client: Optional[NeoAPI] = None
 
 # -------------------------------------------------------
@@ -56,13 +55,12 @@ client: Optional[NeoAPI] = None
 # -------------------------------------------------------
 
 def normalize_base32(raw: str) -> str:
-    """Normalize secret to valid base32."""
+    """Normalize secret to valid base32, removing quotes/spaces and padding."""
     import re, base64
     if not raw:
         raise ValueError("Empty TOTP secret")
     s = re.sub(r"[^A-Za-z2-7]", "", raw).upper()
-    pad = (8 - (len(s) % 8)) % 8
-    s = s + ("=" * pad)
+    s += "=" * ((8 - len(s) % 8) % 8)
     base64.b32decode(s, casefold=True)  # validate
     return s
 
@@ -74,8 +72,8 @@ def pct_change(buf: deque, m: int) -> Optional[float]:
         buf.popleft()
     if len(buf) < 2:
         return None
-    t0, p0 = buf[0]
-    t1, p1 = buf[-1]
+    _, p0 = buf[0]
+    _, p1 = buf[-1]
     if p0 is None or p1 is None:
         return None
     return 100.0 * (p1 - p0) / p0
@@ -93,7 +91,6 @@ def post_tradetron(payload: dict):
     if not TT_WEBHOOK_URL or not TT_API_TOKEN:
         log.info("Tradetron not configured.")
         return
-
     data = {"key": TT_API_TOKEN, **payload}
     try:
         r = requests.post(TT_WEBHOOK_URL, json=data, timeout=5)
@@ -102,14 +99,25 @@ def post_tradetron(payload: dict):
         log.error(f"TT error: {e}")
 
 # -------------------------------------------------------
-# KOTAK LOGIN (OFFICIAL)
+# KOTAK LOGIN (OFFICIAL SDK FLOW)
 # -------------------------------------------------------
 
 def kotak_login():
+    """
+    Official flow per Kotak Neo docs/SDK:
+    - client.login(mobilenumber=..., password=...)
+    - client.session_2fa(OTP=...)
+    """
     global client
 
-    if not all([NEO_MOBILE, NEO_PASSWORD, NEO_TOTP_SECRET, NEO_CONSUMER_KEY]):
-        raise RuntimeError("Missing Kotak Neo credentials.")
+    missing = [k for k, v in {
+        "NEO_MOBILE": NEO_MOBILE,
+        "NEO_PASSWORD": NEO_PASSWORD,
+        "NEO_TOTP_SECRET": NEO_TOTP_SECRET,
+        "NEO_CONSUMER_KEY": NEO_CONSUMER_KEY
+    }.items() if not v]
+    if missing:
+        raise RuntimeError(f"Missing env vars: {', '.join(missing)}")
 
     client = NeoAPI(
         environment="prod",
@@ -118,13 +126,13 @@ def kotak_login():
         neo_fin_key=None
     )
 
-    # Step 1: login to generate OTP
+    # Step 1: Login to initiate OTP flow
     client.login(
         mobilenumber=NEO_MOBILE,
         password=NEO_PASSWORD
     )
 
-    # Step 2: TOTP → session_2fa
+    # Step 2: session_2fa with TOTP
     secret = normalize_base32(NEO_TOTP_SECRET)
     code = pyotp.TOTP(secret).now()
     client.session_2fa(OTP=code)
@@ -147,11 +155,10 @@ async def engine_loop():
             await asyncio.sleep(30)
             continue
 
-        # Collect underlying price (example: GOLDM-FUT — adjust as needed)
+        # Example: fetch underlying LTP (symbol name depends on SDK data model)
         try:
-            # The official docs list quotes endpoints, but not OC.  [1](https://learn.tradetron.tech/p/tttv)
-            # SDK’s fetch for live data uses quote API internally.
-            q = client.quotes(["GOLDM"])
+            # Using SDK quotes (docs show quotes endpoints; OC REST is not published).
+            q = client.quotes(["GOLDM"])  # adjust if your SDK expects different identifiers
             ltp = None
             if isinstance(q, list) and q:
                 ltp = q[0].get("last_price") or q[0].get("ltp")
@@ -160,20 +167,15 @@ async def engine_loop():
         except Exception as e:
             log.error(f"Underlying fetch error: {e}")
 
-        # -------------------------------------------
-        # Option chain NOT supported via public REST.
-        # (Official docs list no OC endpoint.) [1](https://learn.tradetron.tech/p/tttv)[4](https://www.kotakneo.com/investing-guide/trading-account/kotak-neo-trade-api-guide/)
-        # Placeholder: user must implement websockets or instrument-file based logic.
-        # -------------------------------------------
+        # NOTE: OC (Option Chain) is not a documented single REST endpoint in public Neo docs.
+        # Add your websocket/aggregate logic here later if needed.
 
+        u_pct = pct_change(under_buf, LOOKBACK_MIN)
         ce_pct = None
         pe_pct = None
-        u_pct = pct_change(under_buf, LOOKBACK_MIN)
 
-        # Logging only
-        log.info(f"U%={u_pct} CE%={ce_pct} PE%={pe_pct} (Option chain placeholder)")
+        log.info(f"U%={u_pct} CE%={ce_pct} PE%={pe_pct} (OC placeholder)")
 
-        # Alerts only work when CE/PE signals exist
         if ce_pct and pe_pct and should_alert(u_pct, ce_pct, pe_pct):
             now = datetime.now(IST)
             if last_alert_ts is None or now - last_alert_ts >= timedelta(minutes=SILENCE_MIN):
@@ -199,7 +201,7 @@ async def startup():
 
 @app.get("/")
 def root():
-    return {"service": "goldm-premium-guard", "health": "/health"}
+    return {"service": "goldm-premium-guard", "health": "/health", "totp": "/totp"}
 
 @app.get("/health")
 def health():
